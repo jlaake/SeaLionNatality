@@ -1,0 +1,388 @@
+---
+title: "California Sea Lion Natality Analysis - Data Extract"
+author: "Jeff Laake"
+date: "May 16, 2018"
+output: html_document
+---
+
+This document contains the code to extract the data for the sea lion natality analysis. It should be run with R32 unless you have setup 64 bit ODBC. The result of running this code is a file called ZcNat.rda that should be used as the input for the companion file Zc_Natality_Analysis.rmd document.
+
+```{r}
+# Attach the package CalcurData that is used to extract data from Access databases
+library(CalcurData)
+# Attach the marked package from which an ancillary function process.ch is used.
+library(marked)
+# CIPinnipedAnalysis for SST data extract.
+library(CIPinnipedAnalysis)
+```
+
+
+The database used for this analysis is BrandMaster.mdb. By setting dir="" it looks for database in default location which is J:/Master.  The tables ZcBrand, Alive, and smiareacodes are used. This first code section specifies the date range within the season to be used which is the 70 day period between 15-May through 23-July and the interval length which is 10.  Thus, the range is divided into seven 10-day intervals. While these variables can be changed, code in the analysis would have to be modified to allow for the change. The data is extracted for all cohorts from 1987 through "lastcohort" and it uses resighting data from 1990 through "lastyear". The variable "numareas" specifies the field in simareacodes to be used.
+
+```{r }
+dir=NULL
+begin.day="05-15"
+end.day="07-23"
+interval.length=10
+begin=as.numeric(strsplit(begin.day,"-")[[1]])
+begin=begin[1]*100+begin[2]
+end=as.numeric(strsplit(end.day,"-")[[1]])
+end=end[1]*100+end[2]
+
+lastyear=2017
+lastcohort=2013
+numareas="two"
+if(lastyear<lastcohort)
+{
+  cat("\n lastyear < lastcohort; resetting lastyear=lastcohort\n")
+  lastyear=lastcohort
+}
+```
+
+Below is code that extracts, filters data and does some error checking. The first step is to check if there are any discrepancies between the adjsex field in Brand and what is in adjsex in Alive. Sea lions are assigned a sex when branded as a pup but errors are made.  If the sea lion is seen at an older age and the original sex was determined to be an error then the correct sex is put in adjsex in Alive until it has been determined that the new sex is correct and then it is put in adjsex in ZcBrand. This code checks to see if some of the adjustments have not been made in ZcBrand because it is that adjsex field is used to extract Females. If nothing is listed after the code then there are no discrepancies.
+```{r}
+#############################################################################################
+# First find any discrepancies between adjsex in Brand and Alive. This is important because
+# the remaining code assumes that adjsex in Brand is correct
+Brand=getCalcurData("Zc","ZcBrand",dir=dir)
+Brand$brand=as.character(Brand$brand)
+mon=as.POSIXlt(Brand$branddate)$mon+1
+Brand$sex=Brand$adjsex
+Alive=getCalcurData("Zc","Alive",dir=dir)
+Alive$brand=as.character(Alive$brand)
+Alive$pupyear=as.numeric(as.POSIXlt(Alive$sitedate)$year)+1900
+Alive=merge(Alive,Brand[,c("brand","sex","cohort")],by="brand")
+adjs=sapply(split(Alive,Alive$brand),function(x) { 
+  z=x[order(x$sitedate),]
+  as.character(z[nrow(z),"adjsex"])
+})
+df=data.frame(brand=names(adjs),asex=adjs)
+df=merge(df,Brand,by="brand")
+df=df[!is.na(df$asex),]
+# list discrepancies between adjsex in brand and adjsex (asex) in Alive
+subset(df,subset=as.character(df$asex)!=as.character(df$adjsex),select=c("brand","adjsex","asex"))
+#####################################################################################################
+```
+
+Next the females from all included cohorts are extracted from ZcBrand and put in the dataframe Brand. 
+```{r}
+# Now extract the data from ZcBrand table
+Brand=getCalcurData("Zc","ZcBrand",dir=dir)
+Brand$brand=as.character(Brand$brand)
+mon=as.POSIXlt(Brand$branddate)$mon+1
+# Only use brands that are females using adjsex and cohort <= lastcohort
+Brand$sex=Brand$adjsex
+Brand=droplevels(Brand[!Brand$sex%in%c("U","M") & Brand$cohort<=lastcohort,])
+```
+
+Extract all sightings at San Miguel Island from the Alive table between 1990 and lastyear within the date range (15 May - 23 July).
+```{r}
+# get Alive sightings after 1989, on SMI and <= lastyear and between dates begin and end
+Alive=getCalcurData("Zc","Alive",dir=dir)
+Alive$brand=as.character(Alive$brand)
+Alive$pupyear=as.numeric(as.POSIXlt(Alive$sitedate)$year)+1900
+Alive=droplevels(Alive[Alive$pupyear<=lastyear,])
+Alive=Alive[(Alive$sitecode%in%"SMI"&Alive$pupyear>=1990),]
+mday=as.numeric(as.POSIXlt(Alive$sitedate)$mon+1)*100+as.POSIXlt(Alive$sitedate)$mday
+Alive=Alive[mday<=end& mday>=begin,]
+```
+
+Next merge the sightings from Alive with the Brand data and select the relevant fields that will be used in the analysis.
+```{r}
+#merge Alive and brand; natality model will only use females that are known to survive to age 3 or greater 
+# so there is no need to include brands that were never seen again.
+Alive=merge(Alive,Brand[,c("brand","sex","cohort")],by="brand")
+
+#extract needed fields
+Alive=subset(Alive,select=c("brand","sitedate","code","sitecode","withpup","pregnant","photos","sex","cohort"))
+Alive$yearbranded=Alive$cohort
+
+#modify some factor variables and create repro field
+Alive$pregnant=as.character(Alive$pregnant)
+Alive$withpup=as.character(Alive$withpup)
+Alive$pregnant[is.na(Alive$pregnant)]=""
+Alive$withpup[is.na(Alive$withpup)]=""
+Alive$pregnant=factor(Alive$pregnant)
+Alive$withpup=factor(Alive$withpup)
+##
+Alive$repro=ifelse(Alive$withpup%in%c("Y","y","P","p","J","j"),toupper(Alive$withpup),0)
+# drop any unused factor levels
+Alive=droplevels(Alive)
+# Compute resight year
+Alive$resightyear=as.POSIXlt(Alive$sitedate)$year+1900
+```
+
+Next we will tally the number of resightings in each year. We will only consider a sea lion to be resighted if it is seen more than one time (select=1) in the year. However, below we also tally photos (photo.table) and if a sea lion only sighted once but with a photo will be included. 
+```{r}
+# Table resights by brand and resightyear and if any <=select set to 0 otherwise 1; add 1987-1989 years to table with all 0s
+select=1
+resight.count.table=with(Alive,table(brand,resightyear))
+resight.count.table=cbind(matrix(0,ncol=3,nrow=nrow(resight.count.table)),resight.count.table)
+resight.count.table=ifelse(resight.count.table<=select,0,1)
+
+# Table releases by cohort
+cohort.count.table=with(Alive,table(brand,cohort))
+cohort.count.table=ifelse(cohort.count.table<=0,0,1)
+if(lastyear>lastcohort)
+		cohort.count.table=cbind(cohort.count.table, matrix(0,ncol=(lastyear-lastcohort),nrow=nrow(cohort.count.table)))
+
+# Table resights with photo
+Alive$nphotos=ifelse(Alive$photos%in%c("","N")|is.na(Alive$photos),0,1)
+photo.table=with(Alive,tapply(nphotos,list(brand,resightyear),sum))
+photo.table[is.na(photo.table)]=0
+photo.table=cbind(matrix(0,ncol=3,nrow=nrow(photo.table)),photo.table)
+
+capture.history=cohort.count.table+resight.count.table+photo.table
+capture.history[capture.history>1]=1
+colnames(capture.history)=1987:lastyear
+```
+
+The result above is a capture history for each sea lion.  From that data we can devise a cohort (year pup was branded - first one) and the greatest age at which sea lion was resighted. 
+```{r}
+# create lastage_seen and cohort variables for each female
+years=as.numeric(colnames(capture.history))
+lastage_seen=apply(capture.history,1,function(x) {
+  z=years*x
+  max(z)-min(z[z>0])})
+cohort=apply(capture.history,1,function(x) {
+  z=years*x
+  min(z[z>0])})
+```
+
+Next we remove any female that was not seen as a three year old or older.  Three is the first feasible age for a sea lion to reproduce and to avoid modelling survival from initial branding we condition the analysis by only using those sighted at age 3 or older.  This will likely bias estimates of survival at early ages (eg 3-5) because we are using all future sighting data to select the females and only those that survive can be seen. However, we aren't interested in survival for this analysis.
+```{r}
+# only use females that were seen past the age of 2 for this analysis
+lastage_seen=lastage_seen[lastage_seen>2]
+Alive=Alive[Alive$brand%in%names(lastage_seen),]
+```
+
+Add the area to each sighting. If NA it currently sets to 2 because this is setup such that numareas="two".
+```{r}
+# add areas 
+AreaCodes=getCalcurData("Zc","smiareacodes",dir=dir)
+
+Alive=merge(Alive,subset(AreaCodes,select=c("code","two")),by="code",all.x=TRUE)
+if(any(is.na(Alive[,numareas]))) cat("\n*******************\nMissing code values\n*******************")
+Alive[is.na(Alive[,numareas]),numareas]=2
+```
+
+The remainder of the code creates the "robust design" capture histories within/between years although there is no arbitrary within/between structure.  The breeding period from 15 May to 23 July is divided into seven 10 day intervals and each of these is an "occasion" although they are strictly an interval of time.  These are intervals 1 to 7. Interval 8 is the period of time between 23 July of year $y$ and 15 May of year $y+1$.  Interval 8 is the between year period. Each Alive sighting is assigned an "occasion" based on which interval containing the sitedate field. The occasion is a year-occ variable (e.g. 1990-4 which is interval 4 in year 1990). None of the sightings in Alive will be assigned to interval(occasion) 8 because we previously filtered such that Alive only contained sightings from 15 May to 23 July. 
+
+```{r}
+total_length=as.numeric(as.Date(paste("2018",end.day,sep="-"))-as.Date(paste("2018",begin.day,sep="-")))+1
+nint=floor(total_length/interval.length)+1
+interval_days=c(0,seq(1:floor(total_length/interval.length))*interval.length)
+interval_days[length(interval_days)]=total_length
+interval_cuts=NULL
+for(y in 1987:lastyear)
+{
+  begin.date=as.Date(paste(as.character(y),begin.day,sep="-"))
+  interval_cuts=c(interval_cuts,begin.date+interval_days)
+}
+occ_labels1=paste(rep(1987:lastyear,each=length(interval_days)),formatC(1:(length(interval_days)),flag ="00",width=2),sep="-")
+# create an occasion variable using sitedate and interval_cuts 
+Alive$occasion=cut(as.numeric(as.Date(Alive$sitedate)),interval_cuts,include.lowest=TRUE,labels=occ_labels1[-length(occ_labels1)],right=FALSE)
+```
+
+The following code computes the length of the intervals in number of days and this is stored in "time.intervals" which will be used by the "process.data"" function of RMark.
+```{r}
+# compute interval_lengths for time.intervals argument of process.data
+interval_lengths=data.frame(occasion=occ_labels1[-length(occ_labels1)],ilength=diff(interval_cuts),stringsAsFactors = FALSE)
+interval_lengths=interval_lengths[order(interval_lengths$occasion),]
+rownames(interval_lengths)=NULL
+# time intervals in days between occasions
+time.intervals=interval_lengths$ilength[-nrow(interval_lengths)]
+```
+
+
+With each Alive record assigned to an "occasion", we can now construct the multi-state capture history for each sea lion. The Alive records are split by "brand" and by occasion ("occ") and the code below loops over brands and occasions within brand. 
+
+The states in the model are: 
+
+* Y  young prior to first reproduction 
+* N  not reproductive during breeding season or pup dies (not observable)
+* P  pregnant (observable)
+* B  gave birth to pup (observable)
+
+Y is not observable but any sighting of a sea lion of age 1 or 2 is assigned to Y because sea lions of these ages cannot reproduce.  A one year old would have to get pregnant as a pup and a 2 year old would have to get pregnant as a yearling. Neither is possoible.  The Y state transition to P (pregnant: repro = "P") is used to model distribution of age of first reproduction. The P state is observable although with less certainty than the B (birth: repro=Y) state in which a female is seen with a pup. The N (not reproductive) state is only observed when a female is seen nursing a juvenile (repro = "J") and not seen as pregnant or with a pup in the same year. The observation values used in the capture history the states Y,N,P,B and the value U which represents uncertain when the sea lion is seen but its state is not known.
+
+In the same code loops below, an individual covariate "area" and a set of time-varying individual covariates "area_mat" are constructed. For each sea lion, the number of re-sightings in each area (one or two) are counted.  If the majority are in area one, then the variable "area" is assigned 0 for that sea lion and otherwise it is assigned 1. For each occasion for each sea lion, the same computation is constructed for "area_mat". If there are no sightings for an occasion, then the variable "area" is used for that occasion for that sea lion. The values of "area_mat" for occasion $j$ are used to predict the probability of being sighted on occasion $j+1$ and the probability of being uncertain of the birth state on occasion $j+1$. The variable names for area_mat are areayyyy-o where yyyy is the year and o is the interval number 1 to 8 (nint).
+
+```{r}
+# Now loop over each brand and create the multistate capture history
+bybrand=split(Alive,Alive$brand)
+msch=matrix("0",nrow=length(bybrand),ncol=length(levels(Alive$occasion)))
+colnames(msch)=levels(Alive$occasion)
+rownames(msch)=names(bybrand)
+area=NULL
+area_mat=matrix(NA,ncol=length(levels(Alive$occasion)),nrow=length(bybrand))
+for(i in 1:length(bybrand))
+{
+  msch[i,paste(bybrand[[i]][1,"cohort"],"01",sep="-")]="Y"
+  allresightings=bybrand[[i]]
+  cnt1=nrow(allresightings[allresightings$two==1,])
+  cnt2=nrow(allresightings[allresightings$two==2,])
+  if(cnt1>cnt2)
+    area=c(area,0)
+  else
+    area=c(area,1)
+  area_mat[i,]=area[i]
+  j=0
+  for(occ in colnames(msch))
+  {
+    j=j+1
+    resightings=allresightings[allresightings$occasion==occ,]
+    withpup=any(allresightings$repro[allresightings$resightyear==substr(occ,1,4)]%in%c("Y","P"))
+    if(nrow(resightings)>0)
+    {
+      cnt1=nrow(resightings[resightings$two==1,])
+      cnt2=nrow(resightings[resightings$two==2,])
+      area_mat[i,j]=ifelse(cnt1>cnt2,0,1)
+      if(any(resightings$repro=="Y"))
+        msch[i,occ]="B"
+      else
+      {
+        if (any(resightings$repro=="P"))  {
+          msch[i,occ]="P"
+        } else {
+          if(any(resightings$repro=="J")) {
+            if(withpup){
+              cat("\nwithpup",names(bybrand)[i],"  occ = ", occ)
+            } else {
+              msch[i,occ]="N"
+            }
+          }  else {
+            age=as.numeric(strsplit(occ,"-")[[1]][1])-bybrand[[i]][1,"cohort"]
+            if(age<3)
+              msch[i,occ]="Y"
+            else
+              msch[i,occ]="U"
+          }  
+        }
+      }
+    }
+  }
+}
+area_mat=area_mat[,-ncol(area_mat)]
+colnames(area_mat)=paste("area",sort(paste(rep(1987:lastyear,nint),1:nint,sep=""))[-c(1,ncol(msch)+1)],sep="")
+```
+
+
+Next create the dataframe sl which contains the capture history character string (ch) and the area_mat covariates.
+```{r}
+#create data frame
+sl=data.frame(ch=apply(msch,1,paste,collapse=""),stringsAsFactors=F)
+sl=cbind(sl,area_mat)
+```
+
+Check for any invalid transitions which could occur if the wrong value for "repro" was used in Alive records. Invalid transitions would be P or B to N (should not occur based on coding of N above) or Y to N, B or P within year. If nothing is listed below this code then there are no invalid transitions.
+```{r}
+# check for any invalid transitions
+for(i in 1:length(sl$ch))
+{
+  ch=strsplit(sl$ch[i],"")[[1]]
+  if(any(ch=="Y")&any(ch=="N")) {
+    firstN=(1:length(ch))*as.numeric(ch=="N")
+    if(max((1:length(ch))*as.numeric(ch=="Y"))>min(firstN[firstN>0])) 
+          cat("\n N to Y",names(bybrand)[i])
+  }
+  if(any(ch=="Y")&any(ch=="B")) {
+    firstB=(1:length(ch))*as.numeric(ch=="B")
+    if(max((1:length(ch))*as.numeric(ch=="Y"))>min(firstB[firstB>0])) 
+          cat("\n B to Y",names(bybrand)[i])
+  }
+  if(any(ch=="Y")&any(ch=="P")) {
+    firstP=(1:length(ch))*as.numeric(ch=="P")
+    if(max((1:length(ch))*as.numeric(ch=="Y"))>min(firstP[firstP>0])) 
+          cat("\n P to Y",names(bybrand)[i])
+  }
+  j=0
+  for(year in 1987:lastyear)
+  {
+    j=j+1
+    if(year==lastyear)
+      ch=strsplit(substr(sl$ch[i],(j-1)*8+1,(j-1)*8+7),"")[[1]]
+    else    
+    ch=strsplit(substr(sl$ch[i],(j-1)*8+1,j*8),"")[[1]]
+    ch=ch[!ch%in%c("0","U")]
+    
+    if(length(ch)>1)
+    {
+      if(any(ch%in%c("P","B"))&any(ch=="N")) cat("\n ",names(bybrand)[i], " year ",year)
+      if(any(ch=="Y")&any(ch=="N")) cat("\n ",names(bybrand)[i], " year ",year)
+      if(any(ch=="Y")&any(ch=="B")) cat("\n ",names(bybrand)[i], " year ",year)
+      if(any(ch=="Y")&any(ch=="P")) cat("\n ",names(bybrand)[i], " year ",year)
+      if(any(ch=="B"))
+      {
+        firstb=(1:length(ch))*as.numeric(ch=="B")
+        if(any(ch=="B")&max((1:length(ch))*as.numeric(ch=="P"))>min(firstb[firstb>0])) 
+          cat("\n B to P",names(bybrand)[i], " year ",year," ch = ",ch)
+      }
+    }
+  }
+}
+```
+
+Finally, compute time intervals as a fraction of a year (ti). Show tally of observations for all data and by interval. Add cohort to "sl" dataframe and then save "sl" and "ti" in fie ZcNat.rda.
+```{r}
+# time intervals in proportion of a year. 365 days used for regular years and 366 for leap years such that 
+# each year is unit of 1. 
+yeardays=vector(length=lastyear-1987+1)
+for(i in 1:(lastyear-1987))
+    yeardays[i]=sum(time.intervals[((i-1)*8+1):(i*8)])
+if(floor((lastyear+1)/4)==ceiling((lastyear+1)/4))
+{
+  yeardays[lastyear-1987+1]=366
+} else
+  yeardays[lastyear-1987+1]=365
+divisor=rep(yeardays,each=nint)
+divisor=divisor[-c(length(divisor),length(divisor)-1)]
+# ti will be the vector of values fed to process.data function of RMark
+ti=time.intervals/divisor
+
+zz=splitCH(sl$ch)
+colnames(zz)=c(1987,cumsum(ti)+1987)
+
+# show all observed values
+table(as.vector(zz))
+
+# table data values by interval
+for(i in 1:8)
+{
+  cat("\n")
+  print(table(zz[,seq(i,nchar(sl$ch[1]),8)]))
+}
+
+# Add cohort to use as grouping variable
+sl$cohort=factor(floor(as.numeric(colnames(zz)[marked::process.ch(sl$ch)$first])))
+detach("package:marked")
+```
+
+
+Get SST summary data that will be used to model pup survival after birth and transition to pregnancy.
+
+```{r}
+# Create SST Anomalies
+anomalies=create.SST.anomalies(1972:lastyear)
+# Use Locations 2-5 (WSB,PtArg,PtSM,PtSL)
+locations=2:5
+
+SSTAnomalies=t(apply(anomalies[,,locations],c(2,1),mean,na.rm=TRUE))
+SSTAnomalies[is.nan(SSTAnomalies)]=NA
+# Set maxyear, minyear and numyears,lastyear
+maxyear= max(as.numeric(row.names(SSTAnomalies)))
+minyear= min(as.numeric(row.names(SSTAnomalies)))
+numyears=maxyear-minyear+1
+
+MartoJuneAnomalies=average_anomalies(SSTAnomalies,3,4)
+JulytoJuneAnomalies=average_anomalies(SSTAnomalies,7,12)
+SpringSST=data.frame(year=1987:lastyear,SpringSST=MartoJuneAnomalies[names(MartoJuneAnomalies)%in%1987:lastyear])
+AnnualSSTLagged=data.frame(year=1987:lastyear,AnnualSSTLagged=JulytoJuneAnomalies[names(MartoJuneAnomalies)%in%1986:(lastyear-1)])
+AnnualSST=data.frame(year=1987:lastyear,AnnualSST=JulytoJuneAnomalies[names(MartoJuneAnomalies)%in%1987:lastyear])
+```
+
+
+```{r}
+save(sl,ti,SpringSST,AnnualSST,AnnualSSTLagged,file="ZcNat.rda")
+```
+
