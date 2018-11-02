@@ -1,0 +1,315 @@
+---
+title: "Marked Natality Analysis"
+author: "Jeff Laake"
+date: "May 21, 2018"
+output: html_document
+---
+This document contains the code and explanation of the observation data, the model used for the data and the setup for fitting models.  The result is a file named "ZcNatAnalysis.rda" which contains dp (processed data) and ddl (design data list). These objects are used in the calls to the mark function to fit the models.
+
+The breeding season (15 May through 23 July) has been divided into seven 10 day "sampling intervals". All observations within the sampling interval are assigned to that "occasion". Sampling intervals are not truly occasions but they are treated as such in the model. Then there is an 8th interval (non-breeding season) from 24 July to 14 May of following year that is of length 295 or 296 depending on whether following year is a leap year.  The "occasions" are labelled with the time at the beginning of the interval and a label yyyyi where yyyy is the year and i is the interval (1 to 8).  Newly marked pups are "released"" in sampling interval 1 of the year they were branded. They are marked later in the fall during interval 8 but since we aren't modeling survival to age 3 this doesn't matter. 
+
+Sea lions are observed throughout the breeding season and the following reproductive status observations can be recorded when appropriate:
+* P - female is obviously pregnant
+* Y - female is seen with a pup; typically nursing
+* J - female is seen with a juvenile (pup from a previous year); typically nursing
+
+The reproductive status observations depend on the state of the female sea lion. For example, if a female is pregnant or seen with a pup then she is reproductive that year and if she is seen with a juvenile and not with a pup then she was reproductive a previous year but not that year. We define the following reproductive states for the model:
+
+* Y : young sea lion prior to first reproduction
+* N : not reproductive during breeding season (observable if seen with juvenile) or pup dies (not observable)
+* P : pregnant (observable)
+* B : gave birth to pup (observable)
+
+A typical set of state transitions would be for the female to remain in state Y until its first pregnancy when it transitions to P and then to B in the season when the pup is born. If the pup dies during the breeding season the female transitions to state N or if she was not pregnant that year then she is in state N for the entire breeding season.  
+
+A female can be seen multiple times within an interval. If there are multiple observations within the interval, Y over-rides J and P, and P over-rides J. The former occurs once the pup is born and seen during the interval. The latter occurs because a female can be nursing the pup from the prior year before she gives birth to the new pup. If a female is seen with a juvenile, but is not pregnant and never seen with a pup during the breeding season then she is considered to be not reproductive in that year. If a female is seen but her status cannot be determined then it is considered to be unknown.
+
+The natality observation data are modelled using a hidden Markov model in program MARK via the RMark interface. A hidden Markov model is a multi-state model in which the observations can include the states when known or events when the state is not known. In this case the only event is U to specify the state is not certain. States can be observable or unobservable. The only observation for an unobservable state is U. Observable states can result in either a U if uncertain or the value of the state if known.
+
+The allowable state transitions between breeding seasons (occur from interval 7 to interval 8) are:
+* Y to P : first reproduction; first possible transition from age 2 to 3
+* Y to Y : remaining pre-reproductive; computed by subtraction
+* N to P : not reproductive or lost pup in year $y$ shifting to reproductive in year $y+1$
+* N to N : remaining non-reproductive; computed by subtraction
+* B to P : had pup in year $y$ up to 23 July and became pregnant for year $y+1$
+* B to N : had pup in year $y$ up to 23 July but not pregnant for year $y+1$; computed by subtraction 
+
+The allowable state transitions within the breeding season (interval 8 to 1, 1 to 2,...6 to 7)
+* P to B : from pregnant to giving birth (birth distribution); forced to B for interval 6 to 7
+* P to P : remaining pregnant; computed by subtraction
+* B to B : survival of pup 
+* B to N : death of pup; computed by subtraction
+                
+
+Attach marked for data setup functions 
+
+```{r}
+library(marked)
+```
+
+Load data files created by Zc_Natality_Extract.rmd and make adjustments for marked format because extract script was originally written for RMark.
+
+```{r}
+load("ZcNat.rda")
+load("timenames.rda")
+# remove cohort variable - not needed and it causes conflicts with marked
+sl=sl[,-248]
+# rename area variables to use time levels rather than year-occ names as in RMark
+names(sl)[2:247]=paste("area",xx,sep="")
+rm(xx)
+# add sl$area1987 which is not used but allows time.varying for Phi,Psi
+sl$area1987=0
+sl$ch=gsub("U","u",sl$ch)
+```
+
+First, call process.data function in marked to specify model as Multivariate-Multistate model and provide time intervals (ti) and strata.labels (nstate). The "u" implies nstate can be uncertain. The accumulate=FALSE tells the code not to try accumulating capture history data that are similar because with 247 occasions it is unlikely to occur.
+
+```{r}
+# Process data with multi-state uncertainty model
+dp=process.data(sl,begin.time=1987,model="mvmscjs",time.intervals=ti,strata.labels=list(nstate=c("Y","N","P","B","u")),accumulate=FALSE)
+```
+
+Next create the default design data for each parameter except for the parameter "pi" which is not used in this model because the initial state of each release is "Y" when the pup is marked. The following are the model parameters:
+*Phi  : annual survival probability because we have used time intervals that are fractions of years.
+*p     : probability of being resighted during the 10 day sampling interval.
+*Psi   : state-specific probability of transitioning between states
+*delta : state-specific probability of recording "u" for an observation made during an interval
+*pi    : state-specific probability of being a "u" at the initial observation (not used here)
+
+The state transition probabilities from a state to all of the states (including remaining in the state) must sum to 1 for each state. Unlike MARK/RMark for marked there are $K$ records (one for each state).  Which probability that is to be computed by subtraction is specified by fixing its real value to 1 (exp(0)).  The parameter time.varying="area" means that it will take the areaxxx values and change to area using the time value xxx to match up with the design data record.
+
+For each parameter, the marked package creates a design data record for each occasion and state value for each animal.  The structure of the design data will vary slightly depending in the parameter.  For example, for p and Phi, there is only a record for each animal-occasion-state.  But for Psi there is a record for animal-occasion-state-state to allow from one state to another.  For these data the states are B,N,P,Y so there are 4x4=16 state-state combinations for each occasion for each animal.  For delta, there are two records for each animal-occasion-state with the first being the state and the second being "u" because you can either record the state or "u" for an animal that is seen on an occasion.
+
+```{r}
+ddl=make.design.data(dp,parameters=list(p=list(time.varying="area"),
+                                        delta=list(time.varying="area"),
+                                        Phi=list(time.varying="area"),
+                                        Psi=list(time.varying="area"),
+                                        pi=list(time.varying="area")))
+```
+
+Due to differences in time values for the parameters, some of the time varying area values are not needed and for pi most variables are removed because pi is known for these data since they are all released as pups in the "Y" state.
+```{r}
+ddl$p$area1987=NULL
+ddl$delta$area1987=NULL
+ddl$Phi$area2017.16438356164=NULL
+ddl$Psi$area2017.16438356164=NULL
+ddl$pi$area2017.16438356164=NULL
+ddl$pi$area=NULL
+ddl$pi$Time=NULL
+ddl$pi$Cohort=NULL
+ddl$pi$cohort=NULL
+ddl$pi$Age=NULL
+
+```
+
+After creating the default design data, we can now add fields that will help us develop models.  Both age and Age are integer years and not fractions as with time. In addition, we create a factor interval variable for the 8 intervals and a numeric version (Interval). Also, we add agebins, a factor year variable (intercept is 1994) and a numeric version Year.
+```{r}
+# p - additional design data
+times=as.numeric(as.character(ddl$p$time))
+bins=c(0,1e-2,3e-2,6e-2,9e-2,1.1e-1,1.4e-1,1.7e-1,2e-1)
+ddl$p$interval=cut(times-floor(times),bins,labels=c("1","2","3","4","5","6","7","8"),include.lowest=TRUE)
+ddl$p$Interval=as.integer(ddl$p$interval)
+ddl$p$interval=relevel(ddl$p$interval,3)
+ddl$p$Age=as.integer(floor(as.numeric(as.character(ddl$p$time))-as.numeric(as.character(ddl$p$cohort))))
+ddl$p$age=cut(ddl$p$Age,c(-Inf,0:max(ddl$p$Age)),labels=0:max(ddl$p$Age))
+ddl$p$agebin=cut(as.numeric(as.character(ddl$p$age)),c(0,1,3,6,Inf),include.lowest=TRUE)
+ddl$p$Year=as.integer(floor(as.numeric(as.character(ddl$p$time))))
+ddl$p$year=factor(ddl$p$Year)
+ddl$p$year=relevel(ddl$p$year,"1994")
+ddl$p$N=as.integer(ddl$p$stratum=="N")
+ddl$p$B=as.integer(ddl$p$stratum=="B")
+ddl$p$P=as.integer(ddl$p$stratum=="P")
+ddl$p$cohort=NULL
+ddl$p$Cohort=NULL
+ddl$p$area=as.integer(ddl$p$area)
+ddl$p$effort=cut(ddl$p$Year,c(1987,1994,2002,Inf),include.lowest=TRUE)
+```
+
+Now we do the same for Phi.
+```{r}
+# For Phi
+times=as.numeric(as.character(ddl$Phi$time))
+ddl$Phi$interval=cut(times-floor(times),bins,labels=c("1","2","3","4","5","6","7","8"),include.lowest=TRUE)
+ddl$Phi$interval=relevel(ddl$Phi$interval,3)
+ddl$Phi$Age=as.integer(floor(as.numeric(as.character(ddl$Phi$time))-as.numeric(as.character(ddl$Phi$cohort))))
+ddl$Phi$age=cut(ddl$Phi$Age,c(-Inf,0:max(ddl$Phi$Age)),labels=0:max(ddl$Phi$Age))
+ddl$Phi$agebin=cut(as.numeric(as.character(ddl$Phi$age)),c(0,2,6,12,18,Inf),include.lowest=TRUE)
+ddl$Phi$agebin=relevel(ddl$Phi$agebin,"(2,6]")
+ddl$Phi$Year=as.integer(floor(as.numeric(as.character(ddl$Phi$time))))
+ddl$Phi$year=factor(ddl$Phi$Year)
+ddl$Phi$year=relevel(ddl$Phi$year,"1994")
+ddl$Phi$BtSeason=as.integer(ifelse(ddl$Phi$interval=="8",1,0))
+ddl$Phi$N=as.integer(ddl$Phi$stratum=="N")
+ddl$Phi$Y=as.integer(ddl$Phi$stratum=="Y")
+ddl$Phi$P=as.integer(ddl$Phi$stratum=="P")
+ddl$Phi$Cohort=NULL
+ddl$Phi$area=NULL
+```
+
+For Psi, we do much the same as above but for the numeric Interval we switch interval 8 to 0 because transition from state 8 to 1 is first possible transition to B in the breeding season. Now why did we use 8 intervals when there are no observations in the 8th interval. We could have just used 7 intervals and had the period between 7 and 1 be the non-breeding season. By adding the 8th interval we allow transition from states Y,N,B to P between 7 and 8 and then between interval 8 and 1, we can transition from P to P or B.  By adding the 8th interval, from each state you can only transition to one other state or remain in the same state. The agebin variable is used for Y to P transition and the agebinB variable is used for P to B and B to B transitions.
+```{r}
+# For Psi
+times=as.numeric(as.character(ddl$Psi$time))
+ddl$Psi$interval=cut(times-floor(times),bins,labels=c("1","2","3","4","5","6","7","8"),include.lowest=TRUE)
+ddl$Psi$Interval=as.integer(ddl$Psi$interval)
+ddl$Psi$Interval[ddl$Psi$Interval==8]=0
+ddl$Psi$Age=as.integer(floor(as.numeric(as.character(ddl$Psi$time))-as.numeric(as.character(ddl$Psi$cohort))))
+ddl$Psi$age=cut(ddl$Psi$Age,c(-Inf,0:max(ddl$Psi$Age)),labels=0:max(ddl$Psi$Age))
+ddl$Psi$agebin=cut(as.numeric(as.character(ddl$Psi$age)),c(0,2,3,4,5,6,7,12,Inf),include.lowest=TRUE)
+ddl$Psi$agebinB=cut(as.numeric(as.character(ddl$Psi$age)),c(0,3,6,9,Inf),include.lowest=TRUE)
+ddl$Psi$agebinB=relevel(ddl$Psi$agebinB,"(3,6]")
+ddl$Psi$Year=as.integer(floor(as.numeric(as.character(ddl$Psi$time))))
+ddl$Psi$year=cut(ddl$Psi$Year,c(1987,1991,1992:max(ddl$Psi$Year)),include.lowest=TRUE,labels=c("1987-1991",as.character(1992:max(ddl$Psi$Year))))
+ddl$Psi$year=relevel(ddl$Psi$year,"1994")
+ddl$Psi$int7=as.integer(ifelse(ddl$Psi$interval=="7",1,0))
+ddl$Psi$Interval=as.integer(ddl$Psi$Interval)
+ddl$Psi$area=NULL
+ddl$Psi$Cohort=NULL
+```
+
+For Psi, we also define some 0/1 indicator variables to model specific state transitions.
+```{r}
+# N to P can only occur for interval 7
+ddl$Psi$NtoP=as.numeric(ddl$Psi$stratum=="N")*as.numeric(ddl$Psi$tostratum=="P")*as.numeric(ddl$Psi$interval=="7")
+# B to B is not interval specific but below some are fixed to 0 like for 7 and 8; PupS same as BtoB created
+# to avoid problems with model.matrix dropping terms
+ddl$Psi$BtoB=as.numeric(ddl$Psi$stratum=="B")*as.numeric(ddl$Psi$tostratum=="B")
+ddl$Psi$PupS=ddl$Psi$BtoB
+# B to P can only occur for interval 7; exclude early years when all have to be in state Y
+ddl$Psi$BtoP=as.numeric(ddl$Psi$stratum=="B")*as.numeric(ddl$Psi$tostratum=="P")*as.numeric(ddl$Psi$interval=="7")
+# Y to P is not specified for intervals but all other than interval 7 are fixed to 0 below
+ddl$Psi$YtoP=as.numeric(ddl$Psi$stratum=="Y")*as.numeric(ddl$Psi$tostratum=="P")
+# P to B can occur in intervals 8,1 to 5
+#ddl$Psi$PtoB=ddl$Psi$P*ddl$Psi$toB*as.numeric(!ddl$Psi$interval%in%c("6","7"))
+ddl$Psi$PtoB=as.numeric(ddl$Psi$stratum=="P")*as.numeric(ddl$Psi$tostratum=="B")*as.numeric(!ddl$Psi$interval%in%c("7"))
+# P to N for interval 7
+ddl$Psi$PtoN=as.numeric(ddl$Psi$stratum=="P")*as.numeric(ddl$Psi$tostratum=="N")*as.numeric(ddl$Psi$interval=="7")
+```
+
+Similar fields are added for delta except intervals 1&2 are combined because very little data for interval 1 and hit boundary. For time, the factor labels are changed from the decimal time value created in the default design data to a yyyyi value where yyyy is the year and i is the value for the interval.  This is done because the time labels are used to match with any time varying individual covariates.  Some of the models will use an area covariate that is named areayyyyi where yyyy is the year and i is the interval. Covariates are limited to 10 characters which is a hold over from MARK setup but it makes values more readable.  
+```{r}
+# For delta
+times=as.numeric(as.character(ddl$delta$time))
+ddl$delta$interval=cut(times-floor(times),bins,labels=c("1","2","3","4","5","6","7","8"),include.lowest=TRUE)
+ddl$delta$Interval=as.integer(ddl$delta$interval)
+ddl$delta$Year=as.integer(floor(as.numeric(as.character(ddl$delta$time))))
+ddl$delta$year=factor(ddl$delta$Year)
+ddl$delta$year=relevel(ddl$delta$year,"1994")
+ddl$delta$Age=as.integer(floor(as.numeric(as.character(ddl$delta$time))-as.numeric(as.character(ddl$delta$cohort))))
+plabels=sort(paste(rep(sort(unique(ddl$delta$Year)),8),sort(levels(ddl$delta$interval)),sep=""))[-c(1,nchar(sl$ch[1])+1)]
+ddl$delta$time=factor(as.numeric(ddl$delta$time),labels=c("19871",plabels))
+ddl$delta$interval=cut(times-floor(times),bins[-2],labels=c("1&2","3","4","5","6","7","8"),include.lowest=TRUE)
+ddl$delta$N=as.integer(ddl$delta$stratum=="N")
+ddl$delta$B=as.integer(ddl$delta$stratum=="B")
+ddl$delta$area=as.integer(ddl$delta$area)
+ddl$delta$cohort=NULL
+ddl$delta$Cohort=NULL
+ddl$delta$effort=cut(ddl$delta$Year,c(1987,1994,2002,Inf),include.lowest=TRUE)
+```
+
+Now we fix real parameters where appropriate.  For p, if there are no sightings (no effort) for an interval, then we set p to 0. We do that by finding all positions in the capture history (ch) that are either all 0 (not seen) or Y (initial release). The real parameter is fixed by adding a field named "fix" to the design data which is either NA (not fixed but estimated) or the fixed real value which is 0 in this case.  The rows in the p design data are found using the column names of zz which are the decimal time values in p. After the values of fix are assigned, the labels for time are changed to yyyyi so that the area covariate can be used in the model for p.
+
+```{r}
+#######################  Fixed p #########################################
+zz=splitCH(sl$ch)
+colnames(zz)=c(1987,cumsum(ti)+1987)
+fixed0=apply(zz,2,function(x) as.numeric(any(x!="0"&x!="Y")))
+fixed0=names(fixed0[fixed0==0])
+ddl$p$fix=NA
+ddl$p$fix[ddl$p$time%in%fixed0]=0
+plabels=sort(paste(rep(sort(unique(ddl$p$Year)),8),sort(levels(ddl$p$interval)),sep=""))[-c(1,nchar(sl$ch[1])+1)]
+ddl$p$time=factor(as.numeric(ddl$p$time),labels=plabels)
+```
+
+Survival is fixed to 1 for all ages <3 because females were selected such that they were seen at least once at age 3 or older.
+```{r}
+#######################  Fixed S #########################################
+ddl$Phi$fix=NA
+ddl$Phi$fix[ddl$Phi$Age<=2]=1
+```
+
+For Psi, many values are fixed to 0 due to transitions that are not possible. We want state N to be base level for transition from state B, so adjust fix values. The base level (value computed by subtraction) is specified by setting fix=1.  This is done because the link is actually a log-link and the real value is exp(0)=1.  To get parameter set to sum to 1, each value is divided by the sum of the values in the set. For example, exp(beta)/(exp(beta)+exp(0)) and exp(0)/(exp(beta)+exp(0)) could be the probabilities in a system with 2 cells and thus one parameter.
+
+By default, marked sets up the base level (computed by subtraction) as the same value as the state. In other words, the base level is for remaining in the state (stratum) and not moving.  For example, for state B to state B, fix is set to 1 and the rest are set to NA which means the others will be estimated and remaining in state B would be computed by subtraction.  In this case, we want to compute state B to B transition and use B to N as the base level, so this is done below.  For all of the other states we use the default base level.
+
+```{r}
+ddl$Psi$fix[ddl$Psi$stratum=="B"]=NA
+ddl$Psi$fix[ddl$Psi$stratum=="B"&ddl$Psi$tostratum=="N"]=1
+```
+
+The non reproductive state N can only transition to P and only for interval 7 so we set all other transition probabilities to 0.
+```{r}
+# N stratum - non-reproductive
+# N can only go to P or stay in N (by subtraction) 
+ddl$Psi$fix[ddl$Psi$stratum=="N"&!ddl$Psi$tostratum%in%c("P","N")]=0
+# N can only go to P on next to last occasion 7
+ddl$Psi$fix[ddl$Psi$interval!=7&ddl$Psi$stratum=="N"&ddl$Psi$tostratum=="P"]=0
+```
+
+The pre-reproductive state Y can only transition to P and only for interval 7 as well but only once they are 2 or older. No states can transition to Y. 
+```{r}
+#Y stratum - young before first reproduction (not observable after age 2)
+# Y can only go to P
+ddl$Psi$fix[ddl$Psi$stratum=="Y"&!ddl$Psi$tostratum%in%c("Y","P")]=0
+# Y can only go to P at age 2 or older near end of breeding season
+ddl$Psi$fix[(ddl$Psi$Age<2|ddl$Psi$interval!=7)&ddl$Psi$stratum=="Y"&ddl$Psi$tostratum=="P"]=0
+# No states can go to Y
+ddl$Psi$fix[ddl$Psi$stratum!="Y"&ddl$Psi$tostratum=="Y"]=0
+```
+
+The pregnant state P, can only transition to B during intervals 1 to 5. If still in P at interval 6, then it is forced to B by setting that transition probability to 1.
+```{r}
+# P stratum (pregnant - observable)
+# P can only go to B and only during breeding season
+ddl$Psi$fix[ddl$Psi$stratum=="P"&ddl$Psi$tostratum!="P"]=0
+ddl$Psi$fix[ddl$Psi$stratum=="P"&ddl$Psi$tostratum=="B"&ddl$Psi$Interval%in%c(0:5)]=NA
+# Force to B at 5 July (end of breeding season) 
+ddl$Psi$fix[ddl$Psi$interval==6 & ddl$Psi$stratum=="P"&ddl$Psi$tostratum=="P"]=0
+ddl$Psi$fix[ddl$Psi$interval==6 & ddl$Psi$stratum=="P"&ddl$Psi$tostratum=="B"]=1
+```
+
+The birth state can only stay in that state (pup survives) or transition to N (if pup dies) during the breeding season. In interval 7, state B can transition to the pregnant state. It cannot stay in state B in intervals 7 or 8.
+```{r}
+# B stratum (birth - observable with pup)
+# B can only go to N during the season or stay in B; but can go to N or P at interval 7 - N is subtracted for B
+ddl$Psi$fix[ddl$Psi$stratum=="B"&!ddl$Psi$tostratum%in%c("N","B","P")]=0
+ddl$Psi$fix[ddl$Psi$interval!=7 & ddl$Psi$stratum=="B"&ddl$Psi$tostratum=="P"]=0
+ddl$Psi$fix[ddl$Psi$interval%in%7:8 & ddl$Psi$stratum=="B"&ddl$Psi$tostratum=="B"]=0
+```
+
+Display transition matrix fix values by interval to make sure fixed values are set up correctly. What is shown is value of fix for ages 1 and 3 because they differ in their treatment of Y for these ages.   
+```{r}
+with(ddl$Psi[ddl$Psi$id==1&ddl$Psi$age==1,],tapply(fix,list(stratum,tostratum,interval),unique))
+with(ddl$Psi[ddl$Psi$id==1&ddl$Psi$age==3,],tapply(fix,list(stratum,tostratum,interval),unique))
+```
+
+For state Y, all are known up to age 3 so fix delta to 0 and for 3 and older all are unknown so fix delta to 1. The fix for delta for interval 8 is simply to stop it from including that factor level in the model. 
+```{r}
+#######################  Fixed Delta #########################################
+ddl$delta$fix=NA
+ddl$delta$fix[as.character(ddl$delta$stratum)==as.character(ddl$delta$obs.stratum)]=1
+ddl$delta$fix[ddl$delta$stratum=="Y"&ddl$delta$obs.stratum=="u"&ddl$delta$Age<3]=0
+ddl$delta$fix[ddl$delta$stratum=="Y"&ddl$delta$obs.stratum=="u"&ddl$delta$Age>=3]=1
+ddl$delta$fix[ddl$delta$stratum=="Y"&ddl$delta$obs.stratum=="Y"&ddl$delta$Age>=3]=0
+ddl$delta$fix[ddl$delta$interval=="8"&ddl$delta$stratum!="Y"&ddl$delta$obs.stratum=="u"]=0
+```
+
+
+Merge SST data into Psi for modelling transitions and Phi for survival.
+```{r}
+ddl$Psi=merge(ddl$Psi,SpringSST,by.x="Year",by.y="year")
+ddl$Psi=merge(ddl$Psi,AnnualSST,by.x="Year",by.y="year")
+ddl$Psi=merge(ddl$Psi,AnnualSSTLagged,by.x="Year",by.y="year")
+ddl$Psi=ddl$Psi[order(ddl$Psi$order),]
+row.names(ddl$Psi)=ddl$Psi$order
+ddl$Phi=merge(ddl$Phi,AnnualSST,by.x="Year",by.y="year")
+ddl$Phi=ddl$Phi[order(ddl$Phi$order),]
+row.names(ddl$Phi)=ddl$Phi$order
+```
+
+Save file to be read in by model fitting script.
+```{r}
+save(dp,ddl,file="ZcNatAnalysis.rda")
+```
+
